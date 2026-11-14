@@ -105,7 +105,14 @@ function b64encode(buf: Buffer): string {
   return buf.toString('base64');
 }
 function b64decode(text: string): Buffer {
-  return Buffer.from(text.replace(/[\r\n\t ]+/g, ''), 'base64');
+  // F12: Buffer.from(text, 'base64') never throws on garbage — it silently drops
+  // non-alphabet characters. Validate first (alphabet + padding, then a re-encode
+  // round-trip) so invalid content answers 422 instead of a 201 with wrong bytes.
+  const clean = text.replace(/[\r\n\t ]+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) throw new Error('invalid base64 content');
+  const buf = Buffer.from(clean, 'base64');
+  if (buf.toString('base64') !== clean) throw new Error('invalid base64 content');
+  return buf;
 }
 function b64urlEncode(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64url');
@@ -137,15 +144,25 @@ interface TreeEntry {
   name: string;
   oid: string;
 }
+const TREE_MODES = new Set(['40000', '100644', '100755', '120000', '160000', '100664']);
 function parseTree(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let off = 0;
   while (off < data.length) {
     const sp = data.indexOf(0x20, off);
-    const nul = data.indexOf(0x00, sp + 1);
+    const nul = sp < 0 ? -1 : data.indexOf(0x00, sp + 1);
+    if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error('truncated tree entry');
+    const mode = data.subarray(off, sp).toString('ascii');
+    const name = data.subarray(sp + 1, nul).toString('utf8');
+    // Finding 7 / CVE-2026-63478: reject corrupt entries — unknown modes, and
+    // `.` / `..` / slash names that could escape the tree on checkout.
+    if (!TREE_MODES.has(mode)) throw new Error(`invalid tree mode ${mode}`);
+    if (name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+      throw new Error(`invalid tree entry name ${JSON.stringify(name)}`);
+    }
     entries.push({
-      mode: data.subarray(off, sp).toString('ascii'),
-      name: data.subarray(sp + 1, nul).toString('utf8'),
+      mode,
+      name,
       oid: data.subarray(nul + 1, nul + 21).toString('hex'),
     });
     off = nul + 21;
@@ -161,7 +178,9 @@ function buildTree(entries: readonly TreeEntry[]): Buffer {
   const sorted = [...entries].sort(compareTreeNames);
   const parts: Buffer[] = [];
   for (const e of sorted) {
-    parts.push(Buffer.from(`${e.mode} ${e.name}\0`, 'utf8'));
+    // Legacy group-writable mode normalises to 100644 on write (git behaviour).
+    const mode = e.mode === '100664' ? '100644' : e.mode;
+    parts.push(Buffer.from(`${mode} ${e.name}\0`, 'utf8'));
     parts.push(Buffer.from(e.oid, 'hex'));
   }
   return Buffer.concat(parts);
@@ -181,14 +200,22 @@ function parseCommit(data: Buffer): CommitView {
   const parents: string[] = [];
   let author = '';
   let committer = '';
+  // Finding 6: `tree` must be the first line and `parent` lines only immediately
+  // after it — a tree/parent line further down is an ordinary ignored header.
+  let seenOther = false;
   for (const line of data.subarray(0, headEnd).toString('utf8').split('\n')) {
     if (!line) continue;
     const sp = line.indexOf(' ');
     const key = sp < 0 ? line : line.slice(0, sp);
     const val = sp < 0 ? '' : line.slice(sp + 1);
-    if (key === 'tree') tree = val;
-    else if (key === 'parent') parents.push(val);
-    else if (key === 'author') author = val;
+    if (key === 'tree' || key === 'parent') {
+      if (seenOther) continue;
+      if (key === 'tree') tree = val;
+      else parents.push(val);
+      continue;
+    }
+    if (key !== '') seenOther = true; // continuation lines (key '') don't count
+    if (key === 'author') author = val;
     else if (key === 'committer') committer = val;
   }
   return { tree, parents, author, committer, message };
@@ -244,33 +271,45 @@ function collectReachable(
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = commitOf(oid);
+      if (!c) continue;
       queue.push([c.tree, gen]);
       if (opts.depth !== undefined && gen >= opts.depth) continue;
       if (opts.stopAtShallow?.has(oid)) continue;
       for (const p of c.parents) queue.push([p, gen + 1]);
     } else if (obj.type === 'tag') {
-      queue.push([parseTag(obj.data).object, gen]);
+      const t = tagOf(oid);
+      if (t) queue.push([t.object, gen]);
     } else if (obj.type === 'tree') {
-      for (const e of parseTree(obj.data)) {
+      for (const e of treeOf(oid)) {
         if (e.mode !== '160000') queue.push([e.oid, gen]);
       }
     }
   }
   return seen;
 }
-/** Commits reachable from roots, with generation numbers (1 = roots). */
-function commitGenerations(roots: Iterable<string>, lookup: (oid: string) => GitObj | undefined): Map<string, number> {
+/** Commits reachable from roots, with generation numbers (1 = roots). BFS (FIFO), so the
+ * first visit of a commit is always via its SHORTEST path and the generation is minimal.
+ * (F3: the old DFS stack gave inflated generations on merge histories, which picked the
+ * wrong merge base.) `maxGen` caps the walk: commits beyond it are neither recorded nor
+ * expanded — a fetch with deepen=N only needs generations up to N, and a full fetch
+ * needs none at all (its shallow list is empty). BFS visits generations in
+ * non-decreasing order, so capping can never hide a shorter path. */
+function commitGenerations(roots: Iterable<string>, lookup: (oid: string) => GitObj | undefined, maxGen?: number): Map<string, number> {
   const gen = new Map<string, number>();
   const queue: Array<[string, number]> = [];
+  let head = 0;
   for (const r of roots) if (isOid(r)) queue.push([r, 1]);
-  while (queue.length) {
-    const [oid, g] = queue.pop() as [string, number];
+  while (head < queue.length) {
+    const [oid, g] = queue[head++] as [string, number];
+    if (maxGen !== undefined && g > maxGen) continue;
     if (gen.has(oid)) continue;
     const obj = lookup(oid);
     if (!obj || obj.type !== 'commit') continue;
     gen.set(oid, g);
-    for (const p of parseCommit(obj.data).parents) queue.push([p, g + 1]);
+    const c = commitOf(oid);
+    if (!c) continue;
+    if (maxGen === undefined || g < maxGen) for (const p of c.parents) queue.push([p, g + 1]);
   }
   return gen;
 }
@@ -286,34 +325,83 @@ function isAncestor(anc: string, tip: string, lookup: (oid: string) => GitObj | 
     const obj = lookup(oid);
     if (!obj) continue;
     if (obj.type === 'commit') {
-      for (const p of parseCommit(obj.data).parents) {
+      const c = commitOf(oid);
+      if (!c) continue;
+      for (const p of c.parents) {
         if (p === anc) return true;
         queue.push(p);
       }
     } else if (obj.type === 'tag') {
-      const t = parseTag(obj.data).object;
-      if (t === anc) return true;
-      queue.push(t);
+      const t = tagOf(oid);
+      if (!t) continue;
+      if (t.object === anc) return true;
+      queue.push(t.object);
     }
   }
   return false;
 }
-/** First common ancestor of a and b (nearest to both, by generation). */
-function mergeBase(a: string, b: string, lookup: (oid: string) => GitObj | undefined): string | null {
+/** ALL best common ancestors of a and b (go-git recipe, generation-ordered — commit
+ * dates can lie, so generation number is the ordering, never the date). A common
+ * ancestor is "best" when no other common ancestor is its descendant; the
+ * Independents filter drops any candidate reachable from another candidate.
+ * Criss-cross histories have MORE THAN ONE best base (git merge-base --all);
+ * a plain "first common ancestor" walk returns one of them arbitrarily.
+ * With BFS-minimal generations, best ⟺ minimal generation-sum, so the filter
+ * is belt-and-braces on top of the min-sum cut. Deterministic order (oid sort). */
+function mergeBases(a: string, b: string, lookup: (oid: string) => GitObj | undefined): string[] {
+  if (!isOid(a) || !isOid(b)) return [];
+  if (a === b) return [a];
+  // Fast path (go-git ancestorsIndex): if one tip is an ancestor of the other,
+  // it IS the (only) base.
+  if (isAncestor(a, b, lookup)) return [a];
+  if (isAncestor(b, a, lookup)) return [b];
   const ga = commitGenerations([a], lookup);
   const gb = commitGenerations([b], lookup);
-  let best: string | null = null;
-  let bestScore = Infinity;
+  const common: Array<{ oid: string; score: number }> = [];
   for (const [oid, d] of ga) {
     const e = gb.get(oid);
-    if (e === undefined) continue;
-    const score = d + e;
-    if (score < bestScore) {
-      bestScore = score;
-      best = oid;
-    }
+    if (e !== undefined) common.push({ oid, score: d + e });
   }
-  return best;
+  if (common.length === 0) return [];
+  const minScore = Math.min(...common.map((c) => c.score));
+  const best = common.filter((c) => c.score === minScore);
+  const out: string[] = [];
+  for (const c of best) {
+    let dominated = false;
+    for (const d of best) {
+      if (d.oid === c.oid) continue;
+      if (isAncestor(c.oid, d.oid, lookup)) {
+        dominated = true;
+        break;
+      }
+    }
+    if (!dominated) out.push(c.oid);
+  }
+  out.sort();
+  return out;
+}
+/** First best common ancestor of a and b (nearest to both, by generation). */
+function mergeBase(a: string, b: string, lookup: (oid: string) => GitObj | undefined): string | null {
+  const bases = mergeBases(a, b, lookup);
+  return bases.length ? (bases[0] as string) : null;
+}
+/** The merge-base TREE for (a, b): the single best base's tree, or — when several
+ * best bases exist (criss-cross) — the VIRTUAL base: the bases' trees merged
+ * recursively against their own merge-base (git's recursive-merge rule). If the
+ * bases themselves conflict, fall back to the first best base's tree. No common
+ * ancestor (unrelated histories) → the empty tree (F6). */
+function mergeBaseTree(a: string, b: string): string {
+  const bases = mergeBases(a, b, lookupObject);
+  if (bases.length === 0) return emptyTreeOid();
+  let tree = commitOf(bases[0] as string)?.tree ?? '';
+  for (let i = 1; i < bases.length; i++) {
+    const t2 = commitOf(bases[i] as string)?.tree ?? '';
+    const bb = mergeBase(bases[0] as string, bases[i] as string, lookupObject);
+    const bTree = bb ? (commitOf(bb)?.tree ?? '') : emptyTreeOid();
+    if (mergeConflict(bTree, tree, t2)) break; // fall back to the tree so far
+    tree = mergeTree(bTree, tree, t2);
+  }
+  return tree;
 }
 
 // ------------------------------------------------------------------ packfile
@@ -353,6 +441,8 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
     let v = 0;
     let shift = 0;
     for (;;) {
+      // F9: bound the varint loop — a delta of all 0x80 bytes used to spin forever.
+      if (off >= delta.length || shift > 63) throw new Error('delta size varint out of bounds');
       const b = delta[off++] as number;
       v += (b & 0x7f) * 2 ** shift;
       shift += 7;
@@ -363,6 +453,10 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const srcSize = readSize();
   const tgtSize = readSize();
   if (srcSize !== base.length) throw new Error('delta base size mismatch');
+  // go-git vector (TestPatchDeltaWriterOversizedTargetHeader): never size the
+  // destination from the advertised target size alone — a header claiming
+  // MaxInt64 must be rejected, not allocated. 64 MiB is far above any real pack.
+  if (tgtSize > 64 * 1024 * 1024) throw new Error('delta target size out of bounds');
   const out = Buffer.allocUnsafe(tgtSize);
   let written = 0;
   while (off < delta.length) {
@@ -381,10 +475,17 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
         shift += 8;
       }
       if (copySize === 0) copySize = 0x10000;
+      // F9: Buffer.copy silently truncates out-of-range copies while `written`
+      // still advances, so the final size check could pass with zero bytes out.
+      if (off > delta.length) throw new Error('delta copy header out of bounds');
+      if (copyOff + copySize > base.length) throw new Error('delta copy out of bounds');
+      if (written + copySize > tgtSize) throw new Error('delta copy exceeds target size');
       base.copy(out, written, copyOff, copyOff + copySize);
       written += copySize;
     } else if (op !== 0) {
       const n = op & 0x7f;
+      if (off + n > delta.length) throw new Error('delta insert out of bounds');
+      if (written + n > tgtSize) throw new Error('delta insert exceeds target size');
       delta.copy(out, written, off, off + n);
       off += n;
       written += n;
@@ -462,41 +563,65 @@ function readPack(pack: Buffer, options: { resolveBase?: (oid: string) => GitObj
   const objects = new Map<string, GitObj>();
   const resolvedByOid = new Map<string, Raw>();
   const resolving = new Set<number>();
-  const resolve = (e: Raw): { type: ObjType; data: Buffer; oid: string } => {
+  const resolve = (e: Raw, depth = 0): { type: ObjType; data: Buffer; oid: string } => {
     const cached = (e as Raw & { _r?: { type: ObjType; data: Buffer; oid: string } })._r;
     if (cached) return cached;
     if (resolving.has(e.offset)) throw new Error('delta cycle');
+    // Delta chains resolve recursively; cap the depth so a pathological pack
+    // cannot stack-overflow the process (git's hard max is 4095; 1024 is the
+    // stack-safe bound here — real packs stay far below it).
+    if (depth > 1024) throw new Error('delta chain too deep');
     resolving.add(e.offset);
-    let type: ObjType;
-    let data: Buffer;
-    if (e.code === 6) {
-      const base = byOffset.get(e.baseOffset as number);
-      if (!base) throw new Error('ofs-delta base missing');
-      const b = resolve(base);
-      type = b.type;
-      data = applyDelta(b.data, e.data);
-    } else if (e.code === 7) {
-      const baseEntry = resolvedByOid.get(e.baseOid as string);
-      if (baseEntry) {
-        const b = resolve(baseEntry);
+    try {
+      let type: ObjType;
+      let data: Buffer;
+      if (e.code === 6) {
+        const base = byOffset.get(e.baseOffset as number);
+        // An OFS_DELTA base must lie EARLIER in the same pack (a forward
+        // reference is corrupt, not a base that happens to sort later).
+        if (!base || base.offset >= e.offset) throw new Error('ofs-delta base missing');
+        const b = resolve(base, depth + 1);
         type = b.type;
         data = applyDelta(b.data, e.data);
+      } else if (e.code === 7) {
+        // F8: a REF_DELTA may precede its base entry in the pack. On a miss, resolve
+        // the still-unresolved raw entries on demand (memoised) and retry, instead
+        // of throwing although the base is in this same pack.
+        let baseEntry = resolvedByOid.get(e.baseOid as string);
+        if (!baseEntry) {
+          for (const cand of raw) {
+            if ((cand as Raw & { _r?: unknown })._r) continue;
+            try {
+              resolve(cand, depth + 1);
+            } catch {
+              // leave unresolved; the lookup below decides
+            }
+            baseEntry = resolvedByOid.get(e.baseOid as string);
+            if (baseEntry) break;
+          }
+        }
+        if (baseEntry) {
+          const b = resolve(baseEntry, depth + 1);
+          type = b.type;
+          data = applyDelta(b.data, e.data);
+        } else {
+          const external = options.resolveBase?.(e.baseOid as string);
+          if (!external) throw new Error('ref-delta base missing');
+          type = external.type;
+          data = applyDelta(external.data, e.data);
+        }
       } else {
-        const external = options.resolveBase?.(e.baseOid as string);
-        if (!external) throw new Error('ref-delta base missing');
-        type = external.type;
-        data = applyDelta(external.data, e.data);
+        type = CODE_TYPE[e.code] as ObjType;
+        data = e.data;
       }
-    } else {
-      type = CODE_TYPE[e.code] as ObjType;
-      data = e.data;
+      const oid = hashObject(type, data);
+      const out = { type, data, oid };
+      (e as Raw & { _r?: unknown })._r = out;
+      resolvedByOid.set(oid, e);
+      return out;
+    } finally {
+      resolving.delete(e.offset);
     }
-    const oid = hashObject(type, data);
-    const out = { type, data, oid };
-    (e as Raw & { _r?: unknown })._r = out;
-    resolvedByOid.set(oid, e);
-    resolving.delete(e.offset);
-    return out;
   };
   for (const e of raw) {
     const r = resolve(e);
@@ -571,6 +696,8 @@ interface IssueRec {
   closedAt: string | null;
   comments: Array<{ id: number; body: string; createdAt: string }>;
   seq: number;
+  /** Cached JSON.stringify(issueJson(...)) — see issueJsonText/dirtyIssue. */
+  _json?: string;
 }
 interface PullRec {
   number: number;
@@ -604,6 +731,7 @@ interface RepoRec {
   pulls: Map<number, PullRec>;
   nextNumber: number; // shared issue+PR counter, starts at 1
   commentSeq: number;
+  fetchRev: number; // bumped on every ref mutation; fetch-pack cache keys on it
 }
 interface Store {
   repos: Map<string, RepoRec>; // key owner/name
@@ -628,6 +756,56 @@ function storeObject(type: ObjType, data: Buffer): string {
 function lookupObject(oid: string): GitObj | undefined {
   return store.objects.get(oid);
 }
+/** Parsed-commit/tree/tag caches (v2 perf): objects are immutable once stored, so a parsed
+ * view never goes stale. Traversals (fetch, isAncestor, commit lists) re-parse the same
+ * commits thousands of times without these; with them each commit parses once. */
+const commitCache = new Map<string, CommitView>();
+function commitOf(oid: string): CommitView | undefined {
+  let c = commitCache.get(oid);
+  if (c) return c;
+  const obj = lookupObject(oid);
+  if (!obj || obj.type !== 'commit') return undefined;
+  c = parseCommit(obj.data);
+  commitCache.set(oid, c);
+  return c;
+}
+const treeCache = new Map<string, TreeEntry[]>();
+function treeOf(oid: string): TreeEntry[] {
+  let e = treeCache.get(oid);
+  if (e) return e;
+  const obj = lookupObject(oid);
+  e = obj && obj.type === 'tree' ? parseTree(obj.data) : [];
+  treeCache.set(oid, e);
+  return e;
+}
+const tagCache = new Map<string, TagView>();
+function tagOf(oid: string): TagView | undefined {
+  let t = tagCache.get(oid);
+  if (t) return t;
+  const obj = lookupObject(oid);
+  if (!obj || obj.type !== 'tag') return undefined;
+  t = parseTag(obj.data);
+  tagCache.set(oid, t);
+  return t;
+}
+/** Fetch-pack response cache (v2 perf): identical fetch requests (same wants/haves/
+ * depth/filter on the same repo revision) rebuild the same pack bytes every time.
+ * Keyed on repo.fetchRev, which is bumped on every ref mutation; objects are
+ * immutable, so a ref change is the only thing that can change a fetch result. */
+const fetchCache = new Map<string, Buffer>();
+function bumpFetchRev(repo: RepoRec): void {
+  repo.fetchRev += 1;
+}
+function fetchCacheKey(repo: RepoRec, req: FetchReq, proto: 'v2' | 'v0'): string {
+  return `${proto}|${repo.id}|${repo.fetchRev}|${req.wants.join(',')}|${req.haves.join(',')}|${req.deepen ?? ''}|${req.shallowLines.join(',')}|${req.filter ?? ''}|${req.unborn ? 1 : 0}`;
+}
+function fetchCachePut(key: string, body: Buffer): void {
+  if (fetchCache.size >= 64) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  fetchCache.set(key, body);
+}
 function makeRepo(owner: string, name: string, opts: { description?: string; private?: boolean }): RepoRec {
   store.repoSeq += 1;
   const now = isoOf(nextTs());
@@ -647,6 +825,7 @@ function makeRepo(owner: string, name: string, opts: { description?: string; pri
     pulls: new Map(),
     nextNumber: 1,
     commentSeq: 0,
+    fetchRev: 0,
   };
   store.repos.set(repoKey(owner, name), repo);
   return repo;
@@ -688,7 +867,7 @@ function treeGet(rootOid: string, path: string): { oid: string; mode: string } |
   for (let i = 0; i < parts.length; i += 1) {
     const obj = lookupObject(current);
     if (!obj || obj.type !== 'tree') return null;
-    const entry = parseTree(obj.data).find((e) => e.name === parts[i]);
+    const entry = treeOf(current).find((e) => e.name === parts[i]);
     if (!entry) return null;
     if (i === parts.length - 1) return { oid: entry.oid, mode: entry.mode };
     if (entry.mode !== '40000') return null;
@@ -702,7 +881,7 @@ function treeList(rootOid: string): Array<{ path: string; oid: string; mode: str
   const walk = (treeOid: string, prefix: string): void => {
     const obj = lookupObject(treeOid);
     if (!obj || obj.type !== 'tree') return;
-    for (const e of parseTree(obj.data)) {
+    for (const e of treeOf(treeOid)) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
       if (e.mode === '40000') walk(e.oid, p);
       else out.push({ path: p, oid: e.oid, mode: e.mode });
@@ -715,7 +894,7 @@ function treeList(rootOid: string): Array<{ path: string; oid: string; mode: str
 function treeSet(rootOid: string | null, path: string, blobOid: string | null, mode = '100644'): string {
   const parts = path.split('/').filter((p) => p.length > 0);
   const build = (treeOid: string | null, depth: number): string | null => {
-    const entries = treeOid ? parseTree(lookupObject(treeOid)?.data ?? Buffer.alloc(0)) : [];
+    const entries = treeOid ? treeOf(treeOid) : [];
     const name = parts[depth] as string;
     const idx = entries.findIndex((e) => e.name === name);
     let child: string | null;
@@ -747,7 +926,8 @@ function commitList(tip: string): Array<{ oid: string; commit: CommitView; seq: 
   for (const [oid, gen] of gens) {
     const obj = lookupObject(oid);
     if (!obj || obj.type !== 'commit') continue;
-    const commit = parseCommit(obj.data);
+    const commit = commitOf(oid);
+    if (!commit) continue;
     const m = / (\d+) \+0000$/.exec(commit.committer);
     out.push({ oid, commit, seq: commitSeqOf(oid), ts: m ? Number(m[1]) : TIME_BASE_SEC, gen });
   }
@@ -769,7 +949,7 @@ function contentCommit(repo: RepoRec, parentOid: string | null, path: string, co
   let baseTree = '';
   if (parentOid) {
     const parent = lookupObject(parentOid);
-    if (parent && parent.type === 'commit') baseTree = parseCommit(parent.data).tree;
+    if (parent && parent.type === 'commit') baseTree = commitOf(parentOid)?.tree ?? '';
   }
   const newTree = treeSet(baseTree === '' ? null : baseTree, path, blobOid, mode);
   const ts = nextTs();
@@ -784,9 +964,6 @@ function contentCommit(repo: RepoRec, parentOid: string | null, path: string, co
   return { commitOid, blobOid };
 }
 /** The merge base of two commit oids, or null. */
-function baseOf(a: string, b: string): string | null {
-  return mergeBase(a, b, lookupObject);
-}
 /** Files changed between two trees: {path, status, additions, deletions, changes}. */
 function diffFiles(baseTree: string, headTree: string): Array<{ filename: string; status: string; additions: number; deletions: number; changes: number }> {
   const base = new Map(treeList(baseTree).map((e) => [e.path, e.oid]));
@@ -848,21 +1025,23 @@ function mergeConflict(baseTree: string, headTree: string, otherTree: string): b
 }
 /** 3-way merge result tree (head wins where both changed identically; base/other rule per git). */
 function mergeTree(baseTree: string, headTree: string, otherTree: string): string {
-  const base = new Map(treeList(baseTree).map((e) => [e.path, e.oid]));
-  const head = new Map(treeList(headTree).map((e) => [e.path, e.oid]));
-  const other = new Map(treeList(otherTree).map((e) => [e.path, e.oid]));
-  const result = new Map<string, string>();
+  // F5: the result carries {oid, mode} — the old map kept oids only and rebuilt every
+  // file as 100644, losing exec bits, symlinks and submodules on squash merge.
+  const base = new Map(treeList(baseTree).map((e) => [e.path, e]));
+  const head = new Map(treeList(headTree).map((e) => [e.path, e]));
+  const other = new Map(treeList(otherTree).map((e) => [e.path, e]));
+  const result = new Map<string, { oid: string; mode: string }>();
   const paths = new Set([...base.keys(), ...head.keys(), ...other.keys()]);
   for (const p of paths) {
     const b = base.get(p);
     const h = head.get(p);
     const o = other.get(p);
-    if (h === o) {
-      if (h !== undefined) result.set(p, h);
-    } else if (o === b) {
-      if (h !== undefined) result.set(p, h);
-    } else if (h === b) {
-      if (o !== undefined) result.set(p, o);
+    if (h?.oid === o?.oid) {
+      if (h !== undefined) result.set(p, { oid: h.oid, mode: h.mode });
+    } else if (o?.oid === b?.oid) {
+      if (h !== undefined) result.set(p, { oid: h.oid, mode: h.mode });
+    } else if (h?.oid === b?.oid) {
+      if (o !== undefined) result.set(p, { oid: o.oid, mode: o.mode });
     }
   }
   // rebuild nested trees from the flat map
@@ -877,11 +1056,11 @@ function mergeTree(baseTree: string, headTree: string, otherTree: string): strin
     }
     return m;
   };
-  for (const [p, oid] of [...result.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+  for (const [p, v] of [...result.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     const parts = p.split('/');
     const name = parts[parts.length - 1] as string;
     const dir = parts.slice(0, -1).join('/');
-    ensureDir(dir).set(name, { mode: '100644', oid });
+    ensureDir(dir).set(name, { mode: v.mode, oid: v.oid });
   }
   const buildDir = (dir: string): string => {
     const entries: TreeEntry[] = [];
@@ -908,14 +1087,19 @@ function mergeTree(baseTree: string, headTree: string, otherTree: string): strin
 function currentBaseTip(repo: RepoRec, pr: PullRec): string {
   return repo.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha;
 }
+/** The canonical empty tree oid, stored once. F6: the merge base for unrelated histories. */
+let cachedEmptyTree: string | null = null;
+function emptyTreeOid(): string {
+  if (cachedEmptyTree === null) cachedEmptyTree = storeObject('tree', buildTree([]));
+  return cachedEmptyTree;
+}
 /** Whether a squash merge of `pr` onto the current base tip would conflict. */
-function prHasConflict(repo: RepoRec, pr: PullRec): boolean | null {
+function prHasConflict(repo: RepoRec, pr: PullRec): boolean {
   const baseTip = currentBaseTip(repo, pr);
-  const mb = baseOf(baseTip, pr.headSha);
-  if (mb === null) return null;
-  const baseTree = parseCommit(lookupObject(baseTip)?.data ?? Buffer.alloc(0)).tree;
-  const headTree = parseCommit(lookupObject(pr.headSha)?.data ?? Buffer.alloc(0)).tree;
-  const mbTree = parseCommit(lookupObject(mb)?.data ?? Buffer.alloc(0)).tree;
+  // mergeBaseTree handles criss-cross (virtual base) and unrelated (empty tree, F6).
+  const mbTree = mergeBaseTree(baseTip, pr.headSha);
+  const baseTree = commitOf(baseTip)?.tree ?? '';
+  const headTree = commitOf(pr.headSha)?.tree ?? '';
   return mergeConflict(mbTree, headTree, baseTree);
 }
 /** Squash-merge a PR onto its base branch. Returns {commitOid} or null on conflict. */
@@ -926,9 +1110,7 @@ function squashMerge(repo: RepoRec, pr: PullRec): { commitOid: string } | null {
   if (!baseCommit || baseCommit.type !== 'commit' || !headCommit || headCommit.type !== 'commit') return null;
   const baseTree = parseCommit(baseCommit.data).tree;
   const headTree = parseCommit(headCommit.data).tree;
-  const mb = baseOf(baseTip, pr.headSha);
-  if (mb === null) return null;
-  const mbTree = parseCommit(lookupObject(mb)?.data ?? Buffer.alloc(0)).tree;
+  const mbTree = mergeBaseTree(baseTip, pr.headSha);
   if (mergeConflict(mbTree, headTree, baseTree)) return null;
   const mergedTree = mergeTree(mbTree, headTree, baseTree);
   const ts = nextTs();
@@ -1085,6 +1267,29 @@ function issueJson(r: RepoRec, i: IssueRec): Record<string, unknown> {
     repository_url: `https://api.github.com/repos/${r.owner}/${r.name}`,
   };
 }
+/** Serialized-issue cache (v2 perf): the read workload re-serializes the same issue
+ * 2.000×. The JSON string is cached on the record and invalidated by dirtyIssue()
+ * on every mutation (PATCH, comment add, GraphQL close/comment). */
+function issueJsonText(r: RepoRec, i: IssueRec): string {
+  if (i._json === undefined) i._json = JSON.stringify(issueJson(r, i));
+  return i._json;
+}
+function dirtyIssue(i: IssueRec): void {
+  i._json = undefined;
+}
+function sendJsonText(ctx: Ctx, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  const headers: Record<string, string> = {
+    'Content-Type': JSON_TYPE,
+    'X-GitHub-Request-Id': ctx.reqId,
+    'X-GitHub-Media-Type': 'github.v3',
+    'X-RateLimit-Limit': '5000',
+    'X-RateLimit-Remaining': '4999',
+    'X-RateLimit-Reset': String(Math.floor(TIME_BASE_SEC / 1) + 3600),
+    ...extraHeaders,
+  };
+  ctx.res.writeHead(status, headers);
+  ctx.res.end(text);
+}
 function pullJson(r: RepoRec, p: PullRec): Record<string, unknown> {
   return {
     id: 300000 + r.id * 1000 + p.number,
@@ -1111,7 +1316,6 @@ function pullJson(r: RepoRec, p: PullRec): Record<string, unknown> {
 function prMergeable(r: RepoRec, p: PullRec): string {
   if (p.state === 'closed') return 'UNKNOWN';
   const conflict = prHasConflict(r, p);
-  if (conflict === null) return 'UNKNOWN';
   return conflict ? 'CONFLICTING' : 'MERGEABLE';
 }
 function commitJson(oid: string): Record<string, unknown> {
@@ -1280,6 +1484,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
       if (!lookupObject(sha)) return sendError(ctx, 422, 'Object does not exist'), true;
       if (repo.refs.has(ref)) return sendError(ctx, 422, 'Reference already exists'), true;
       repo.refs.set(ref, sha);
+      bumpFetchRev(repo);
       repo.updatedAt = isoOf(nextTs());
       sendJson(ctx, 201, { ref, object: { sha } });
       return true;
@@ -1309,7 +1514,9 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
     }
     // /contents/*
     if (rest[0] === 'contents') {
-      const path = rest.slice(1).map((s) => decodeURIComponent(s)).join('/');
+      // F4: segments arrive already decoded by the router — decoding again turned
+      // `a%2Fb.txt` (%252F) into nested `a/b.txt` and threw on a bare `%`.
+      const path = rest.slice(1).join('/');
       if (ctx.method === 'GET') {
         const refParam = ctx.url.searchParams.get('ref');
         const tip = refParam ? resolveRef(repo, refParam) : defaultTip(repo);
@@ -1385,6 +1592,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           }
           const { commitOid, blobOid } = contentCommit(repo, tip, path, bytes, message);
           repo.refs.set(refName, commitOid);
+          bumpFetchRev(repo);
           repo.updatedAt = isoOf(nextTs());
           sendJson(ctx, existing ? 200 : 201, { content: { name: path.split('/').pop(), path, sha: blobOid, encoding: 'base64' }, commit: { sha: commitOid } });
           return true;
@@ -1403,6 +1611,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
         const commitOid = storeObject('commit', commit);
         noteCommit(commitOid);
         repo.refs.set(refName, commitOid);
+        bumpFetchRev(repo);
         repo.updatedAt = isoOf(nextTs());
         sendJson(ctx, 200, { content: null, commit: { sha: commitOid } });
         return true;
@@ -1469,7 +1678,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
             seq: nextSeq(),
           };
           repo.issues.set(number, issue);
-          sendJson(ctx, 201, issueJson(repo, issue));
+          sendJsonText(ctx, 201, issueJsonText(repo, issue));
           return true;
         }
         return false;
@@ -1480,7 +1689,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
       if (rest.length === 2) {
         if (ctx.method === 'GET') {
           if (!issue) return sendError(ctx, 404, 'Not Found'), true;
-          sendJson(ctx, 200, issueJson(repo, issue));
+          sendJsonText(ctx, 200, issueJsonText(repo, issue));
           return true;
         }
         if (ctx.method === 'PATCH') {
@@ -1494,7 +1703,8 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           if (typeof parsed.value.title === 'string') issue.title = parsed.value.title;
           if (typeof parsed.value.body === 'string') issue.body = parsed.value.body;
           issue.updatedAt = isoOf(nextTs());
-          sendJson(ctx, 200, issueJson(repo, issue));
+          dirtyIssue(issue);
+          sendJsonText(ctx, 200, issueJsonText(repo, issue));
           return true;
         }
         return false;
@@ -1514,6 +1724,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           const comment = { id: repo.commentSeq, body, createdAt: isoOf(nextTs()) };
           issue.comments.push(comment);
           issue.updatedAt = isoOf(nextTs());
+          dirtyIssue(issue);
           sendJson(ctx, 201, { id: comment.id, body, user: { login: VIEWER_LOGIN, id: VIEWER_ID }, created_at: comment.createdAt, updated_at: comment.createdAt });
           return true;
         }
@@ -1585,12 +1796,8 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
       if (rest[2] === 'files' && rest.length === 3) {
         if (ctx.method !== 'GET') return false;
         if (!pr) return sendError(ctx, 404, 'Not Found'), true;
-        const mb = baseOf(pr.baseSha, pr.headSha);
-        if (mb === null) {
-          sendJson(ctx, 200, []);
-          return true;
-        }
-        const mbTree = parseCommit(lookupObject(mb)?.data ?? Buffer.alloc(0)).tree;
+        // mergeBaseTree: single base, virtual base (criss-cross), or empty tree (F6).
+        const mbTree = mergeBaseTree(pr.baseSha, pr.headSha);
         const headTree = parseCommit(lookupObject(pr.headSha)?.data ?? Buffer.alloc(0)).tree;
         sendJson(ctx, 200, diffFiles(mbTree, headTree));
         return true;
@@ -1600,11 +1807,11 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
         if (!pr) return sendError(ctx, 404, 'Not Found'), true;
         if (pr.state === 'closed') return sendError(ctx, 405, 'Pull request already merged or closed'), true;
         const conflict = prHasConflict(repo, pr);
-        if (conflict === null) return sendError(ctx, 405, 'No merge base'), true;
         if (conflict) return sendError(ctx, 405, 'Merge conflict'), true;
         const result = squashMerge(repo, pr);
         if (!result) return sendError(ctx, 405, 'Merge conflict'), true;
         repo.refs.set(`refs/heads/${pr.baseRef}`, result.commitOid);
+        bumpFetchRev(repo);
         pr.state = 'closed';
         pr.merged = true;
         pr.mergedAt = isoOf(nextTs());
@@ -1883,7 +2090,7 @@ class GqlExecutor {
   private issueCursor(repoId: number, n: number): string {
     return b64urlEncode(`cursor:${repoId}:${n}`);
   }
-  private issuesFor(repo: RepoRec, args: Record<string, unknown>): { list: IssueRec[]; hasNext: boolean; endCursor: string | null } {
+  private issuesFor(repo: RepoRec, args: Record<string, unknown>): { list: IssueRec[]; hasNext: boolean; endCursor: string | null; totalCount: number } {
     const states = Array.isArray(args.states) ? (args.states as string[]) : null;
     const orderBy = args.orderBy as { field?: string; direction?: string } | undefined;
     const first = typeof args.first === 'number' ? args.first : null;
@@ -1893,6 +2100,8 @@ class GqlExecutor {
       const want = new Set(states.map((s) => s.toLowerCase()));
       list = list.filter((i) => want.has(i.state));
     }
+    // F11: totalCount is the states-filtered count, before after/first slicing.
+    const totalCount = list.length;
     const dir = orderBy?.direction === 'ASC' ? 'asc' : 'desc';
     list.sort((a, b) => (dir === 'asc' ? a.seq - b.seq : b.seq - a.seq));
     if (after) {
@@ -1914,7 +2123,7 @@ class GqlExecutor {
       list = list.slice(0, first);
     }
     const endCursor = list.length ? this.issueCursor(repo.id, (list[list.length - 1] as IssueRec).number) : null;
-    return { list, hasNext, endCursor };
+    return { list, hasNext, endCursor, totalCount };
   }
   private repoFields(repo: RepoRec, sels: GqlSelection[], typeName: string): Record<string, unknown> {
     const out: Record<string, unknown> = {};
@@ -1968,13 +2177,13 @@ class GqlExecutor {
           break;
         }
         case 'issues': {
-          const { list, hasNext, endCursor } = this.issuesFor(repo, sel.args);
+          const { list, hasNext, endCursor, totalCount } = this.issuesFor(repo, sel.args);
           const children = sel.children ?? [];
           const nodeSels = children.find((c) => c.field === 'nodes')?.children ?? [];
           out[key] = {
             nodes: list.map((i) => this.issueFields(repo, i, nodeSels)),
             pageInfo: { hasNextPage: hasNext, hasPreviousPage: false, startCursor: list.length ? this.issueCursor(repo.id, (list[0] as IssueRec).number) : null, endCursor },
-            totalCount: repo.issues.size,
+            totalCount,
           };
           break;
         }
@@ -2144,13 +2353,9 @@ class GqlExecutor {
         }
         case 'files': {
           const first = typeof sel.args.first === 'number' ? sel.args.first : null;
-          const mb = baseOf(pr.baseSha, pr.headSha);
-          let paths: string[] = [];
-          if (mb !== null) {
-            const mbTree = parseCommit(lookupObject(mb)?.data ?? Buffer.alloc(0)).tree;
-            const headTree = parseCommit(lookupObject(pr.headSha)?.data ?? Buffer.alloc(0)).tree;
-            paths = diffFiles(mbTree, headTree).map((f) => f.filename);
-          }
+          const mbTree = mergeBaseTree(pr.baseSha, pr.headSha);
+          const headTree = parseCommit(lookupObject(pr.headSha)?.data ?? Buffer.alloc(0)).tree;
+          let paths: string[] = diffFiles(mbTree, headTree).map((f) => f.filename);
           if (first !== null) paths = paths.slice(0, first);
           const nodeSels = (sel.children ?? []).find((c) => c.field === 'nodes')?.children ?? [];
           out[key] = { nodes: paths.map((p) => {
@@ -2304,6 +2509,7 @@ class GqlExecutor {
         issue.state = 'closed';
         issue.closedAt = isoOf(nextTs());
         issue.updatedAt = isoOf(nextTs());
+        dirtyIssue(issue);
         const children = sel.children ?? [];
         const issueSel = children.find((c) => c.field === 'issue');
         out[key] = { issue: issueSel ? this.issueFields(repo, issue, issueSel.children ?? []) : { number: issue.number, id: globalId('issue', repo.id, issue.number), state: 'CLOSED' } };
@@ -2355,10 +2561,6 @@ class GqlExecutor {
           continue;
         }
         const conflict = prHasConflict(repo, pr);
-        if (conflict === null) {
-          this.errors.push({ message: 'No merge base' });
-          continue;
-        }
         if (conflict) {
           this.errors.push({ message: 'Merge conflict' });
           continue;
@@ -2369,6 +2571,7 @@ class GqlExecutor {
           continue;
         }
         repo.refs.set(`refs/heads/${pr.baseRef}`, result.commitOid);
+        bumpFetchRev(repo);
         pr.state = 'closed';
         pr.merged = true;
         pr.mergedAt = isoOf(nextTs());
@@ -2390,6 +2593,7 @@ class GqlExecutor {
         repo.commentSeq += 1;
         const comment = { id: repo.commentSeq, body: typeof input.body === 'string' ? input.body : '', createdAt: isoOf(nextTs()) };
         issue.comments.push(comment);
+        dirtyIssue(issue);
         const children = sel.children ?? [];
         const edgeSel = children.find((c) => c.field === 'commentEdge');
         const nodeSel = edgeSel?.children?.find((c) => c.field === 'node');
@@ -2629,11 +2833,11 @@ function mcpTools(): McpToolDef[] {
         if (!pr) return { ok: false, payload: { error: 'Pull request not found' } };
         if (pr.state === 'closed') return { ok: false, payload: { error: 'Pull request already merged or closed' } };
         const conflict = prHasConflict(repo, pr);
-        if (conflict === null) return { ok: false, payload: { error: 'No merge base' } };
         if (conflict) return { ok: false, payload: { error: 'Merge conflict' } };
         const result = squashMerge(repo, pr);
         if (!result) return { ok: false, payload: { error: 'Merge conflict' } };
         repo.refs.set(`refs/heads/${pr.baseRef}`, result.commitOid);
+        bumpFetchRev(repo);
         pr.state = 'closed';
         pr.merged = true;
         pr.mergedAt = isoOf(nextTs());
@@ -2818,7 +3022,7 @@ function lsRefsV2(repo: RepoRec, rawLines: string[]): Buffer {
     if (symrefs && name === `refs/heads/${repo.defaultBranch}`) line += ` symref-target:refs/heads/${repo.defaultBranch}`;
     if (peel) {
       const obj = lookupObject(oid);
-      if (obj && obj.type === 'tag') line += ` peeled:${parseTag(obj.data).object}`;
+      if (obj && obj.type === 'tag') line += ` peeled:${tagOf(oid)?.object ?? ''}`;
     }
     out.push(pktLine(`${line}\n`));
   }
@@ -2854,8 +3058,11 @@ function parseFetchV2(packets: Array<{ type: 'data'; payload: Buffer } | { type:
 }
 /** Build the fetch pack response for a set of wanted oids, honoring haves/depth/shallow. */
 function buildFetchPack(repo: RepoRec, req: FetchReq): { pack: Buffer; acks: string[]; newShallow: string[]; unshallow: string[] } {
-  const gens = commitGenerations(req.wants, lookupObject);
   const depth = req.deepen ?? null;
+  // Generations are needed ONLY for the shallow list (commits at g === depth).
+  // A full fetch (depth null) never reads them; a shallow fetch only needs g <= depth.
+  // The old code walked the whole history on every fetch.
+  const gens = depth !== null ? commitGenerations(req.wants, lookupObject, depth) : new Map<string, number>();
   // objects to send: reachable(wants, depth) minus haveClosure (haves, stopping at previous shallow boundaries)
   const haveClosure = collectReachable(req.haves, lookupObject, { stopAtShallow: new Set(req.shallowLines) });
   const wantReachable = collectReachable(req.wants, lookupObject, depth !== null ? { depth } : {});
@@ -2873,7 +3080,7 @@ function buildFetchPack(repo: RepoRec, req: FetchReq): { pack: Buffer; acks: str
   for (const s of req.shallowLines) {
     const obj = lookupObject(s);
     if (!obj || obj.type !== 'commit') continue;
-    const parents = parseCommit(obj.data).parents;
+    const parents = commitOf(s)?.parents ?? [];
     if (parents.some((p) => toSend.has(p) || wantReachable.has(p))) unshallow.push(s);
   }
   const acks: string[] = [];
@@ -2890,7 +3097,12 @@ function buildFetchPack(repo: RepoRec, req: FetchReq): { pack: Buffer; acks: str
   const objects: GitObj[] = [];
   for (const oid of toSend) {
     const o = lookupObject(oid);
-    if (o) objects.push(o);
+    if (!o) continue;
+    // F7: honour the advertised `filter` — `blob:none` omits blobs, `tree:0` omits
+    // trees and blobs (commits always sent). Previously advertised but ignored.
+    if (req.filter === 'blob:none' && o.type === 'blob') continue;
+    if (req.filter === 'tree:0' && (o.type === 'blob' || o.type === 'tree')) continue;
+    objects.push(o);
   }
   return { pack: writePack(objects), acks, newShallow, unshallow };
 }
@@ -2958,6 +3170,12 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
       }
       // command=fetch
       const req = parseFetchV2(parsed.packets);
+      const cacheKey = fetchCacheKey(repo, req, 'v2');
+      const cached = fetchCache.get(cacheKey);
+      if (cached) {
+        sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, cached);
+        return true;
+      }
       const { pack, acks, newShallow, unshallow } = buildFetchPack(repo, req);
       const out: Buffer[] = [];
       const ackLines = acks.length ? acks : ['NAK'];
@@ -2975,7 +3193,9 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
       out.push(pktLine('packfile\n'));
       out.push(sidebandPackets(pack));
       out.push(PKT_FLUSH);
-      sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, Buffer.concat(out));
+      const body = Buffer.concat(out);
+      fetchCachePut(cacheKey, body);
+      sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, body);
       return true;
     }
     // v0 fetch
@@ -2990,7 +3210,30 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
       else if (line.startsWith('shallow ')) shallowLines.push(line.slice(8).trim());
       else if (line.startsWith('deepen ')) deepen = Number(line.slice(7).trim());
     }
+    // F1: a v0 fetch body continues after the first flush (want… / flush / have… /
+    // done / flush). decodePktLines stops at that flush, so have/done live in
+    // parsed.rest — decode it too, otherwise every v0 fetch is NAK + full resend.
+    if (parsed.rest.length > 0) {
+      try {
+        const post = decodePktLines(parsed.rest);
+        // NOTE: post.lines are Buffers (unlike `lines` above, which are strings).
+        for (const raw of post.lines.map((b) => b.toString('utf8'))) {
+          const line = raw.trim();
+          if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+          else if (line.startsWith('shallow ')) shallowLines.push(line.slice(8).trim());
+          else if (line.startsWith('deepen ')) deepen = Number(line.slice(7).trim());
+        }
+      } catch {
+        // trailing garbage after the flush: keep the pre-flush parse
+      }
+    }
     const req: FetchReq = { wants, haves, shallowLines, deepen, filter: null, unborn: false };
+    const cacheKey = fetchCacheKey(repo, req, 'v0');
+    const cached = fetchCache.get(cacheKey);
+    if (cached) {
+      sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, cached);
+      return true;
+    }
     const { pack, acks, newShallow, unshallow } = buildFetchPack(repo, req);
     const out: Buffer[] = [];
     if (acks.length) {
@@ -3001,7 +3244,9 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
     for (const s of newShallow) out.push(pktLine(`shallow ${s}\n`));
     for (const s of unshallow) out.push(pktLine(`unshallow ${s}\n`));
     out.push(sidebandPackets(pack));
-    sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, Buffer.concat(out));
+    const body = Buffer.concat(out);
+    fetchCachePut(cacheKey, body);
+    sendRaw(ctx, 200, UPLOAD_RESULT_TYPE, body);
     return true;
   }
   // git-receive-pack
@@ -3060,6 +3305,7 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
           continue;
         }
         repo.refs.delete(cmd.ref);
+        bumpFetchRev(repo);
         reportLines.push(`ok ${cmd.ref}`);
         continue;
       }
@@ -3087,7 +3333,9 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
         reportLines.push(`ng ${cmd.ref} object is not a commit or tag`);
         continue;
       }
-      if (cmd.old !== ZERO_OID && obj.type === 'commit' && !isAncestor(cmd.old, cmd.next, lookupObject)) {
+      // F10: the fast-forward check used to be skipped for tag objects, so updating a
+      // tag ref to an unrelated tag was accepted. isAncestor already walks tag targets.
+      if (cmd.old !== ZERO_OID && !isAncestor(cmd.old, cmd.next, lookupObject)) {
         reportLines.push(`ng ${cmd.ref} non-fast-forward`);
         continue;
       }
@@ -3096,11 +3344,12 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
     }
     for (const r of okRefs) {
       repo.refs.set(r.ref, r.next);
+      bumpFetchRev(repo);
       const obj = lookupObject(r.next);
       if (obj && obj.type === 'commit') noteCommit(r.next);
       if (obj && obj.type === 'tag') {
         // note tag target commit too
-        const target = parseTag(obj.data).object;
+        const target = tagOf(r.next)?.object ?? '';
         const tObj = lookupObject(target);
         if (tObj && tObj.type === 'commit') noteCommit(target);
       }
@@ -3122,25 +3371,28 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
 export function createApp(): Server {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const server = createServer(async (req, res) => {
-    const ctx: Ctx = {
-      req,
-      res,
-      method: req.method ?? 'GET',
-      url: new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`),
-      parts: [],
-      body: Buffer.alloc(0),
-      token,
-      reqId: nextReqId(),
-    };
+    // F2: URL parsing + percent-decoding live INSIDE the try: a malformed % sequence
+    // used to throw URIError out of this callback and crash the process (Node 22
+    // default on unhandled rejection). Now it answers 400 and the server stays up.
     try {
-      ctx.body = await readBody(req);
-    } catch {
-      ctx.body = Buffer.alloc(0);
-    }
-    const path = ctx.url.pathname;
-    const parts = path.split('/').filter((s) => s.length > 0).map((s) => decodeURIComponent(s));
-    ctx.parts = parts;
-    try {
+      const ctx: Ctx = {
+        req,
+        res,
+        method: req.method ?? 'GET',
+        url: new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`),
+        parts: [],
+        body: Buffer.alloc(0),
+        token,
+        reqId: nextReqId(),
+      };
+      try {
+        ctx.body = await readBody(req);
+      } catch {
+        ctx.body = Buffer.alloc(0);
+      }
+      const path = ctx.url.pathname;
+      const parts = path.split('/').filter((s) => s.length > 0).map((s) => decodeURIComponent(s));
+      ctx.parts = parts;
       if (parts[0] === 'healthz' && parts.length === 1) {
         sendJson(ctx, 200, { ok: true });
         return;
@@ -3165,7 +3417,9 @@ export function createApp(): Server {
       sendError(ctx, 404, 'Not Found');
     } catch (err) {
       if (!res.headersSent) {
-        sendError(ctx, 500, err instanceof Error ? err.message : 'internal error');
+        const bad = err instanceof URIError;
+        res.writeHead(bad ? 400 : 500, { 'Content-Type': JSON_TYPE });
+        res.end(JSON.stringify({ message: bad ? 'Bad Request: malformed URL encoding' : err instanceof Error ? err.message : 'internal error' }));
       } else {
         res.end();
       }
