@@ -1149,9 +1149,6 @@ function sendJson(ctx: Ctx, status: number, value: unknown, extraHeaders: Record
     'Content-Type': JSON_TYPE,
     'X-GitHub-Request-Id': ctx.reqId,
     'X-GitHub-Media-Type': 'github.v3',
-    'X-RateLimit-Limit': '5000',
-    'X-RateLimit-Remaining': '4999',
-    'X-RateLimit-Reset': String(Math.floor(TIME_BASE_SEC / 1) + 3600),
     ...extraHeaders,
   };
   ctx.res.writeHead(status, headers);
@@ -1171,6 +1168,8 @@ function sendError(ctx: Ctx, status: number, message: string): void {
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  if (chunks.length === 0) return Buffer.alloc(0);
+  if (chunks.length === 1) return chunks[0] as Buffer;
   return Buffer.concat(chunks);
 }
 function parseJsonBody(ctx: Ctx): { ok: true; value: Record<string, unknown> } | { ok: false } {
@@ -1282,9 +1281,6 @@ function sendJsonText(ctx: Ctx, status: number, text: string, extraHeaders: Reco
     'Content-Type': JSON_TYPE,
     'X-GitHub-Request-Id': ctx.reqId,
     'X-GitHub-Media-Type': 'github.v3',
-    'X-RateLimit-Limit': '5000',
-    'X-RateLimit-Remaining': '4999',
-    'X-RateLimit-Reset': String(Math.floor(TIME_BASE_SEC / 1) + 3600),
     ...extraHeaders,
   };
   ctx.res.writeHead(status, headers);
@@ -3385,13 +3381,22 @@ export function createApp(): Server {
         token,
         reqId: nextReqId(),
       };
-      try {
-        ctx.body = await readBody(req);
-      } catch {
+      // E2: a GET/HEAD with no body never needs the stream drained; skipping the
+      // async-iterator + end-of-stream wait saves the per-GET overhead. Any request
+      // that DOES carry a body (content-length > 0 or chunked) still goes through readBody.
+      const cl = req.headers['content-length'];
+      const hasBody = (cl !== undefined && cl !== '0') || req.headers['transfer-encoding'] !== undefined;
+      if (!hasBody && (ctx.method === 'GET' || ctx.method === 'HEAD')) {
         ctx.body = Buffer.alloc(0);
+      } else {
+        try {
+          ctx.body = await readBody(req);
+        } catch {
+          ctx.body = Buffer.alloc(0);
+        }
       }
       const path = ctx.url.pathname;
-      const parts = path.split('/').filter((s) => s.length > 0).map((s) => decodeURIComponent(s));
+      const parts = path.split('/').filter((s) => s.length > 0).map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
       ctx.parts = parts;
       if (parts[0] === 'healthz' && parts.length === 1) {
         sendJson(ctx, 200, { ok: true });
